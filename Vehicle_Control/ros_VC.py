@@ -62,9 +62,12 @@ class VehicleController(Node):
         self.CONTROL_TIMEOUT = 1.0   # seconds – after this with no cmd_vel → IPG takes over
 
         # -------------------------------------------------
-        # ROS
+        # ROS - PUBLISHER for toy car
         # -------------------------------------------------
-        self.create_subscription(Twist, '/cmd_vel', self.cmdvel_callback, 10)
+        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        
+        # Subscription for commands from traffic light detection
+        self.create_subscription(Twist, '/cmd_vel_command', self.cmdvel_callback, 10)
 
         # DEFAULT: Full IPGDriver control (both lateral + longitudinal)
         self.cm.DVA_write(self.q_lat_passive, 0)   # IPG always steers (follows maneuver/path)
@@ -74,9 +77,17 @@ class VehicleController(Node):
 
     # -------------------------------------------------
     def cmdvel_callback(self, msg: Twist):
+        """Receives command from traffic light detection script"""
         self.desired_velocity = msg.linear.x
         self.last_cmd_time = self.get_clock().now()
-        self.get_logger().info(f"Received /cmd_vel: {self.desired_velocity:.2f} m/s")
+        self.get_logger().info(f"Received command: {self.desired_velocity:.2f} m/s")
+
+    # -------------------------------------------------
+    def publish_velocity_to_toy_car(self, velocity):
+        """Always publish velocity to toy car - either ROS command or CarMaker actual velocity"""
+        msg = Twist()
+        msg.linear.x = velocity
+        self.cmd_vel_publisher.publish(msg)
 
     # -------------------------------------------------
     def control_loop(self):
@@ -93,23 +104,28 @@ class VehicleController(Node):
                 in_ros_mode = True
 
         if in_ros_mode:
-            # ROS override active
+            # ROS override active - control simulation AND publish to toy car
             self.cm.DVA_write(self.q_long_passive, 1)
-            self.cm.DVA_write(self.q_gear, 1)  # or handle reverse if needed
+            self.cm.DVA_write(self.q_gear, 1)
 
-            # CRITICAL: Check if desired velocity is ZERO (stop command)
-            if abs(self.desired_velocity) < 0.01:  # Desired velocity is zero
+            # Check if desired velocity is ZERO (stop command)
+            if abs(self.desired_velocity) < 0.01:
                 # Apply full brake to stop and hold
                 self.cm.DVA_write(self.q_gas, 0.0)
                 self.cm.DVA_write(self.q_brake, self.BRAKE_HOLD_VALUE)
                 
+                # Publish ZERO to toy car
+                self.publish_velocity_to_toy_car(0.0)
+                
                 if abs(actual_velocity) < self.STOPPED_THRESHOLD:
                     self.get_logger().info(
-                        f"🔴 STOPPED & HOLDING: vel={actual_velocity:.3f} m/s, brake={self.BRAKE_HOLD_VALUE}"
+                        f"🔴 ROS MODE - STOPPED & HOLDING: vel={actual_velocity:.3f} m/s, "
+                        f"brake={self.BRAKE_HOLD_VALUE}, toy_car_cmd=0.0"
                     )
                 else:
                     self.get_logger().info(
-                        f"🟡 BRAKING TO STOP: vel={actual_velocity:.3f} m/s → 0.0 m/s, brake={self.BRAKE_HOLD_VALUE}"
+                        f"🟡 ROS MODE - BRAKING TO STOP: vel={actual_velocity:.3f} m/s, "
+                        f"brake={self.BRAKE_HOLD_VALUE}, toy_car_cmd=0.0"
                     )
             
             else:
@@ -131,13 +147,17 @@ class VehicleController(Node):
                 self.cm.DVA_write(self.q_gas, gas)
                 self.cm.DVA_write(self.q_brake, brake)
                 
+                # Publish desired velocity to toy car
+                self.publish_velocity_to_toy_car(self.desired_velocity)
+                
                 self.get_logger().info(
-                    f"🟢 NORMAL CONTROL: target={self.desired_velocity:.2f}, "
-                    f"actual={actual_velocity:.2f}, gas={gas:.3f}, brake={brake:.3f}"
+                    f"🟢 ROS MODE - NORMAL CONTROL: target={self.desired_velocity:.2f}, "
+                    f"actual={actual_velocity:.2f}, gas={gas:.3f}, brake={brake:.3f}, "
+                    f"toy_car_cmd={self.desired_velocity:.2f}"
                 )
 
         else:
-            # Handover to CarMaker / IPGDriver
+            # CarMaker has control - publish CarMaker's actual velocity to toy car
             self.cm.DVA_write(self.q_long_passive, 0)
 
             # Set neutral values
@@ -147,15 +167,23 @@ class VehicleController(Node):
             # Release ALL active DVA overrides
             self.cm.DVA_release()
 
+            # CRITICAL: Publish CarMaker's actual velocity to toy car
+            self.publish_velocity_to_toy_car(actual_velocity)
+
             # Logging on transition (prevents spamming)
             if hasattr(self, '_was_in_ros_mode') and self._was_in_ros_mode:
                 self.get_logger().info(
-                    "⚪ Handover complete: Driver.Long.passive=0 + DVAReleaseQuants sent. "
-                    "All VC overrides released → IPGDriver now fully in control."
+                    f"⚪ CARMAKER MODE: IPGDriver in control. "
+                    f"Publishing Car.v={actual_velocity:.2f} m/s to toy car"
                 )
                 self._was_in_ros_mode = False
+            elif not hasattr(self, '_was_in_ros_mode'):
+                # First time in CarMaker mode
+                self.get_logger().info(
+                    f"⚪ CARMAKER MODE: Publishing Car.v={actual_velocity:.2f} m/s to toy car"
+                )
 
-        self._was_in_ros_mode = in_ros_mode  # track for next cycle
+        self._was_in_ros_mode = in_ros_mode
 
 def main(args=None):
     rclpy.init(args=args)
@@ -166,12 +194,15 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        # Gentle shutdown – give control back to IPG
+        # Gentle shutdown – give control back to IPG and stop toy car
         node.cm.DVA_write(node.q_long_passive, 0)
         node.cm.DVA_write(node.q_gas, 0.0)
         node.cm.DVA_write(node.q_brake, 0.0)
         node.cm.DVA_release()
         node.cm.read()
+        
+        # Stop toy car
+        node.publish_velocity_to_toy_car(0.0)
 
         node.destroy_node()
         rclpy.shutdown()
@@ -181,4 +212,6 @@ if __name__ == '__main__':
     main()
 
 
-# code changed to handle zero desired velocity by applying full brake to stop and hold the vehicle.
+
+# code changed to subscribe to /cmd_vel_command instead of /cmd_vel to avoid conflict with toy car publisher and 
+# added publishing actual velocity to toy car when IPG has control.
