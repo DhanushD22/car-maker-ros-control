@@ -2,7 +2,6 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from rclpy.time import Time
 
 from pycarmaker import CarMaker, Quantity
 
@@ -10,178 +9,233 @@ from pycarmaker import CarMaker, Quantity
 class VehicleController(Node):
     def __init__(self):
         super().__init__('carmaker_ros_control')
-        self.get_logger().info("CarMaker ROS Speed Controller Starting...")
+        self.get_logger().info("CarMaker ROS Integrated Controller Starting...")
 
-        # -------------------------------------------------
         # Connect to CarMaker
-        # -------------------------------------------------
         self.cm = CarMaker("192.168.0.162", 16660)
         self.cm.connect()
         self.get_logger().info("Connected to IPG CarMaker")
 
-        # -------------------------------------------------
         # Quantities
-        # -------------------------------------------------
         self.q_lat_passive  = Quantity("Driver.Lat.passive",  Quantity.INT)
         self.q_long_passive = Quantity("Driver.Long.passive", Quantity.INT)
-
         self.q_gas       = Quantity("VC.Gas",   Quantity.FLOAT)
         self.q_brake     = Quantity("VC.Brake", Quantity.FLOAT)
         self.q_gear      = Quantity("VC.GearNo", Quantity.INT)
         self.q_velocity  = Quantity("Car.v", Quantity.FLOAT)
 
-        for q in (
-            self.q_lat_passive,
-            self.q_long_passive,
-            self.q_gas,
-            self.q_brake,
-            self.q_gear,
-            self.q_velocity
-        ):
+        for q in (self.q_lat_passive, self.q_long_passive, self.q_gas, 
+                  self.q_brake, self.q_gear, self.q_velocity):
             self.cm.subscribe(q)
 
-        # -------------------------------------------------
-        # Control parameters (TUNE THESE)
-        # -------------------------------------------------
+        # Control parameters
         self.KF_GAS   = 0.03
         self.KP_GAS   = 0.08
         self.KP_BRAKE = 0.10
         self.MAX_GAS  = 1.0
         self.MAX_BRAKE = 1.0
+        self.ERROR_DEADBAND = 0.10
+        self.STEADY_GAS = 0.08
+        self.BRAKE_HOLD_VALUE = 1.0
+        self.STOPPED_THRESHOLD = 0.05
 
-        # Deadband and hold parameters
-        self.ERROR_DEADBAND = 0.10   # ±0.1 m/s tolerance
-        self.STEADY_GAS = 0.08       # Constant throttle to maintain speed
+        # Toy car velocity limits
+        self.MAX_TOY_CAR_VELOCITY = 2.0
+        self.MIN_TOY_CAR_VELOCITY = 0.7
+        self.CAR_MOVING_THRESHOLD = 0.1  # Car.v must be > 0.1 to apply min velocity
+
+        # Control inputs (unified object avoidance)
+        self.traffic_light_cmd = None
+        self.object_avoid_cmd = None
+        self.object_avoid_brake = None
         
-        # Brake hold parameters
-        self.BRAKE_HOLD_VALUE = 1.0      # Full brake when stopped
-        self.STOPPED_THRESHOLD = 0.05    # Vehicle considered stopped below this velocity (m/s)
+        # Last command times
+        self.last_traffic_time = None
+        self.last_object_time = None
+        
+        self.CONTROL_TIMEOUT = 0.5  # 500ms
 
-        self.desired_velocity = 0.0
-        self.last_cmd_time = None
-        self.CONTROL_TIMEOUT = 1.0   # seconds – after this with no cmd_vel → IPG takes over
-
-        # -------------------------------------------------
-        # ROS - PUBLISHER for toy car
-        # -------------------------------------------------
+        # ROS Subscriptions and Publishers
+        self.create_subscription(Twist, '/traffic_light_cmd', self.traffic_light_callback, 10)
+        self.create_subscription(Twist, '/object_avoidance_cmd', self.object_avoidance_callback, 10)
         self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-        
-        # Subscription for commands from traffic light detection
-        self.create_subscription(Twist, '/cmd_vel_command', self.cmdvel_callback, 10)
 
-        # DEFAULT: Full IPGDriver control (both lateral + longitudinal)
-        self.cm.DVA_write(self.q_lat_passive, 0)   # IPG always steers (follows maneuver/path)
-        self.cm.DVA_write(self.q_long_passive, 0)  # IPG controls gas/brake/gear by default
+        # DEFAULT: IPGDriver control
+        self.cm.DVA_write(self.q_lat_passive, 0)
+        self.cm.DVA_write(self.q_long_passive, 0)
 
+        self._was_in_ros_mode = False
         self.create_timer(0.02, self.control_loop)  # 50 Hz
 
-    # -------------------------------------------------
-    def cmdvel_callback(self, msg: Twist):
-        """Receives command from traffic light detection script"""
-        self.desired_velocity = msg.linear.x
-        self.last_cmd_time = self.get_clock().now()
-        self.get_logger().info(f"Received command: {self.desired_velocity:.2f} m/s")
+    def traffic_light_callback(self, msg: Twist):
+        self.traffic_light_cmd = msg.linear.x
+        self.last_traffic_time = self.get_clock().now()
+        self.get_logger().info(f"[TL] Received: {self.traffic_light_cmd:.2f} m/s")
 
-    # -------------------------------------------------
-    def publish_velocity_to_toy_car(self, velocity):
-        """Always publish velocity to toy car - either ROS command or CarMaker actual velocity"""
+    def object_avoidance_callback(self, msg: Twist):
+        self.object_avoid_cmd = msg.linear.x
+        self.object_avoid_brake = msg.angular.z
+        self.last_object_time = self.get_clock().now()
+        self.get_logger().info(f"[OBJ] Received: vel={self.object_avoid_cmd:.2f}, brake={self.object_avoid_brake:.2f}")
+
+    def publish_to_toy_car(self, velocity, control_source="UNKNOWN"):
+        """
+        Publish velocity to toy car with proper limits:
+        - CarMaker mode: Apply 0.7 m/s minimum ONLY when Car.v > 0.1 m/s (actually moving)
+        - ROS mode: Use calculated velocity directly
+        """
+        if control_source == "CARMAKER":
+            # CRITICAL FIX: Only apply minimum when car is actually moving
+            if velocity > self.CAR_MOVING_THRESHOLD:
+                # Car is moving - apply minimum velocity
+                if velocity < self.MIN_TOY_CAR_VELOCITY:
+                    limited_velocity = self.MIN_TOY_CAR_VELOCITY
+                elif velocity > self.MAX_TOY_CAR_VELOCITY:
+                    limited_velocity = self.MAX_TOY_CAR_VELOCITY
+                else:
+                    limited_velocity = velocity
+            else:
+                # Car is stopped or nearly stopped - publish actual velocity (including 0)
+                limited_velocity = min(velocity, self.MAX_TOY_CAR_VELOCITY)
+        else:
+            # ROS control - use calculated velocity with max limit
+            limited_velocity = min(velocity, self.MAX_TOY_CAR_VELOCITY)
+        
         msg = Twist()
-        msg.linear.x = velocity
+        msg.linear.x = limited_velocity
         self.cmd_vel_publisher.publish(msg)
+        
+        return limited_velocity
 
-    # -------------------------------------------------
+    def is_command_active(self, last_time):
+        if last_time is None:
+            return False
+        elapsed = (self.get_clock().now() - last_time).nanoseconds / 1e9
+        return elapsed < self.CONTROL_TIMEOUT
+
     def control_loop(self):
         self.cm.read()
         actual_velocity = self.q_velocity.data or 0.0
 
-        now = self.get_clock().now()
+        # Check active systems
+        traffic_active = self.is_command_active(self.last_traffic_time)
+        object_active = self.is_command_active(self.last_object_time)
         
-        # Determine if we have a recent command
+        # Priority: Traffic > Object Avoidance > CarMaker
         in_ros_mode = False
-        if self.last_cmd_time is not None:
-            elapsed = (now - self.last_cmd_time).nanoseconds / 1e9
-            if elapsed < self.CONTROL_TIMEOUT:
-                in_ros_mode = True
+        desired_velocity = 0.0
+        control_source = "CARMAKER"
+        
+        if traffic_active:
+            # Highest priority: Traffic light
+            in_ros_mode = True
+            desired_velocity = self.traffic_light_cmd
+            control_source = "TRAFFIC"
+        elif object_active:
+            # Second priority: Object avoidance (unified AEB + ACC)
+            in_ros_mode = True
+            desired_velocity = self.object_avoid_cmd
+            control_source = "OBJECT"
+        else:
+            # Default: CarMaker
+            in_ros_mode = False
+            control_source = "CARMAKER"
 
         if in_ros_mode:
-            # ROS override active - control simulation AND publish to toy car
+            # ROS override active - stay in control until clear
             self.cm.DVA_write(self.q_long_passive, 1)
             self.cm.DVA_write(self.q_gear, 1)
 
-            # Check if desired velocity is ZERO (stop command)
-            if abs(self.desired_velocity) < 0.01:
-                # Apply full brake to stop and hold
-                self.cm.DVA_write(self.q_gas, 0.0)
-                self.cm.DVA_write(self.q_brake, self.BRAKE_HOLD_VALUE)
+            # Handle object avoidance with proportional braking
+            if control_source == "OBJECT" and self.object_avoid_brake is not None:
+                brake_force = self.object_avoid_brake
                 
-                # Publish ZERO to toy car
-                self.publish_velocity_to_toy_car(0.0)
+                # Full emergency stop
+                if brake_force >= 0.99 or abs(desired_velocity) < 0.01:
+                    self.cm.DVA_write(self.q_gas, 0.0)
+                    self.cm.DVA_write(self.q_brake, 1.0)
+                    toy_vel = self.publish_to_toy_car(0.0, control_source)
+                    
+                    if abs(actual_velocity) < self.STOPPED_THRESHOLD:
+                        self.get_logger().error(f"🔴 [OBJ] EMERGENCY STOP! vel={actual_velocity:.3f}")
+                    else:
+                        self.get_logger().warning(f"🟠 [OBJ] FULL BRAKE: vel={actual_velocity:.3f} → 0.0")
                 
-                if abs(actual_velocity) < self.STOPPED_THRESHOLD:
-                    self.get_logger().info(
-                        f"🔴 ROS MODE - STOPPED & HOLDING: vel={actual_velocity:.3f} m/s, "
-                        f"brake={self.BRAKE_HOLD_VALUE}, toy_car_cmd=0.0"
-                    )
+                # Proportional control
                 else:
+                    error = desired_velocity - actual_velocity
+                    gas = 0.0
+                    
+                    if error > 0 and brake_force < 0.3:
+                        # Accelerate gently
+                        gas = self.KF_GAS * desired_velocity + self.KP_GAS * error
+                        gas = min(max(gas, 0.0), self.MAX_GAS * (1.0 - brake_force))
+                        brake = brake_force * 0.5
+                    else:
+                        # Decelerate
+                        gas = 0.0
+                        brake = brake_force
+                    
+                    self.cm.DVA_write(self.q_gas, gas)
+                    self.cm.DVA_write(self.q_brake, brake)
+                    toy_vel = self.publish_to_toy_car(desired_velocity, control_source)
+                    
                     self.get_logger().info(
-                        f"🟡 ROS MODE - BRAKING TO STOP: vel={actual_velocity:.3f} m/s, "
-                        f"brake={self.BRAKE_HOLD_VALUE}, toy_car_cmd=0.0"
+                        f"🟡 [OBJ] target={desired_velocity:.2f}, actual={actual_velocity:.2f}, "
+                        f"brake={brake:.2f}, toy={toy_vel:.2f}"
                     )
             
+            # Traffic light stop
+            elif abs(desired_velocity) < 0.01:
+                self.cm.DVA_write(self.q_gas, 0.0)
+                self.cm.DVA_write(self.q_brake, self.BRAKE_HOLD_VALUE)
+                toy_vel = self.publish_to_toy_car(0.0, control_source)
+                
+                if abs(actual_velocity) < self.STOPPED_THRESHOLD:
+                    self.get_logger().info(f"🔴 [{control_source}] STOPPED")
+                else:
+                    self.get_logger().info(f"🟡 [{control_source}] BRAKING → 0.0")
+            
+            # Normal velocity control
             else:
-                # Normal velocity control (positive desired velocity)
-                error = self.desired_velocity - actual_velocity
+                error = desired_velocity - actual_velocity
                 gas = 0.0
                 brake = 0.0
 
                 if abs(error) < self.ERROR_DEADBAND:
-                    if self.desired_velocity > 0.3:
+                    if desired_velocity > 0.3:
                         gas = self.STEADY_GAS
                 else:
                     if error > 0:
-                        gas = self.KF_GAS * self.desired_velocity + self.KP_GAS * error
+                        gas = self.KF_GAS * desired_velocity + self.KP_GAS * error
                         gas = min(max(gas, 0.0), self.MAX_GAS)
                     else:
                         brake = min(self.KP_BRAKE * (-error), self.MAX_BRAKE)
 
                 self.cm.DVA_write(self.q_gas, gas)
                 self.cm.DVA_write(self.q_brake, brake)
-                
-                # Publish desired velocity to toy car
-                self.publish_velocity_to_toy_car(self.desired_velocity)
+                toy_vel = self.publish_to_toy_car(desired_velocity, control_source)
                 
                 self.get_logger().info(
-                    f"🟢 ROS MODE - NORMAL CONTROL: target={self.desired_velocity:.2f}, "
-                    f"actual={actual_velocity:.2f}, gas={gas:.3f}, brake={brake:.3f}, "
-                    f"toy_car_cmd={self.desired_velocity:.2f}"
+                    f"🟢 [{control_source}] target={desired_velocity:.2f}, "
+                    f"actual={actual_velocity:.2f}, toy={toy_vel:.2f}"
                 )
 
         else:
-            # CarMaker has control - publish CarMaker's actual velocity to toy car
+            # CarMaker control
             self.cm.DVA_write(self.q_long_passive, 0)
-
-            # Set neutral values
-            self.cm.DVA_write(self.q_gas,   0.0)
+            self.cm.DVA_write(self.q_gas, 0.0)
             self.cm.DVA_write(self.q_brake, 0.0)
-
-            # Release ALL active DVA overrides
             self.cm.DVA_release()
 
-            # CRITICAL: Publish CarMaker's actual velocity to toy car
-            self.publish_velocity_to_toy_car(actual_velocity)
+            # FIXED: Proper velocity publishing for toy car
+            toy_vel = self.publish_to_toy_car(actual_velocity, control_source)
 
-            # Logging on transition (prevents spamming)
-            if hasattr(self, '_was_in_ros_mode') and self._was_in_ros_mode:
+            if self._was_in_ros_mode:
                 self.get_logger().info(
-                    f"⚪ CARMAKER MODE: IPGDriver in control. "
-                    f"Publishing Car.v={actual_velocity:.2f} m/s to toy car"
+                    f"⚪ [CARMAKER] Restored. Car.v={actual_velocity:.2f} → toy={toy_vel:.2f}"
                 )
                 self._was_in_ros_mode = False
-            elif not hasattr(self, '_was_in_ros_mode'):
-                # First time in CarMaker mode
-                self.get_logger().info(
-                    f"⚪ CARMAKER MODE: Publishing Car.v={actual_velocity:.2f} m/s to toy car"
-                )
 
         self._was_in_ros_mode = in_ros_mode
 
@@ -194,16 +248,12 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        # Gentle shutdown – give control back to IPG and stop toy car
         node.cm.DVA_write(node.q_long_passive, 0)
         node.cm.DVA_write(node.q_gas, 0.0)
         node.cm.DVA_write(node.q_brake, 0.0)
         node.cm.DVA_release()
         node.cm.read()
-        
-        # Stop toy car
-        node.publish_velocity_to_toy_car(0.0)
-
+        node.publish_to_toy_car(0.0, "SHUTDOWN")
         node.destroy_node()
         rclpy.shutdown()
 
@@ -213,5 +263,4 @@ if __name__ == '__main__':
 
 
 
-# code changed to subscribe to /cmd_vel_command instead of /cmd_vel to avoid conflict with toy car publisher and 
-# added publishing actual velocity to toy car when IPG has control.
+# fixed the min velocity to only apply when car is actually moving
